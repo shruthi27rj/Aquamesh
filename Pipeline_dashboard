@@ -1,0 +1,1094 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import networkx as nx
+import plotly.graph_objects as go
+
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score, confusion_matrix
+
+
+# ==========================
+# Page / Layout Configuration
+# ==========================
+st.set_page_config(
+    page_title="City Water Pipeline Network Portal",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# ==========================
+# Utility: Session State Helpers
+# ==========================
+STATE_KEYS = [
+    "G",
+    "coords_df",
+    "sim_df",
+    "feature_df",
+    "leak_model",
+    "abnormal_model",
+    "metrics",
+    "risk_df",
+    "current_tick",
+    "sources",
+    "demands",
+]
+
+
+def init_session_state():
+    for k in STATE_KEYS:
+        if k not in st.session_state:
+            st.session_state[k] = None
+
+
+init_session_state()
+
+
+# ==========================
+# Core Model Functions
+# ==========================
+def generate_pipeline_network(rows=8, cols=8, extra_loops=5, seed=42):
+    """
+    Generate a city-like grid of junctions connected by pipelines.
+    Nodes = Junctions, Edges = Pipelines.
+    """
+    rng = np.random.default_rng(seed)
+    G = nx.Graph()
+
+    # Add junctions with coordinates and default attributes
+    for i in range(rows):
+        for j in range(cols):
+            node_id = f"J-{i}-{j}"
+            G.add_node(
+                node_id,
+                x=j,
+                y=rows - 1 - i,  # flip y for nicer display
+                pressure=50.0,
+                pH=7.2,
+                leak_truth=0,
+                abnormal_truth=0,
+            )
+
+    # Connect neighbors (up/down/left/right)
+    for i in range(rows):
+        for j in range(cols):
+            node_id = f"J-{i}-{j}"
+            # Right neighbor
+            if j < cols - 1:
+                nbr_id = f"J-{i}-{j+1}"
+                G.add_edge(
+                    node_id,
+                    nbr_id,
+                    capacity=float(rng.integers(80, 120)),
+                    flow=0.0,
+                    status="normal",
+                )
+            # Down neighbor
+            if i < rows - 1:
+                nbr_id = f"J-{i+1}-{j}"
+                G.add_edge(
+                    node_id,
+                    nbr_id,
+                    capacity=float(rng.integers(80, 120)),
+                    flow=0.0,
+                    status="normal",
+                )
+
+    # Add some extra loops for realism
+    nodes = list(G.nodes())
+    for _ in range(extra_loops):
+        u = rng.choice(nodes)
+        v = rng.choice(nodes)
+        if u != v and not G.has_edge(u, v):
+            G.add_edge(
+                u,
+                v,
+                capacity=float(rng.integers(80, 120)),
+                flow=0.0,
+                status="normal",
+            )
+
+    coords_data = [
+        {"junction_id": n, "x": G.nodes[n]["x"], "y": G.nodes[n]["y"]}
+        for n in G.nodes()
+    ]
+    coords_df = pd.DataFrame(coords_data)
+
+    return G, coords_df
+
+
+def simulate_conditions(
+    G,
+    n_ticks=50,
+    leak_prob=0.03,
+    ph_prob=0.03,
+    pressure_anom_prob=0.02,
+    seed=123,
+):
+    """
+    Simulate pressure and pH over time for each junction.
+    Returns a DataFrame with per-junction-per-tick features and labels.
+    """
+    rng = np.random.default_rng(seed)
+
+    baseline_pressure_mean = 50.0
+    baseline_pressure_std = 5.0
+    baseline_pH_mean = 7.2
+    baseline_pH_std = 0.2
+
+    records = []
+
+    # Keep running state of pressure/pH so anomalies propagate over time
+    current_pressure = {}
+    current_pH = {}
+
+    for node in G.nodes():
+        current_pressure[node] = rng.normal(baseline_pressure_mean, baseline_pressure_std)
+        current_pH[node] = rng.normal(baseline_pH_mean, baseline_pH_std)
+
+    for tick in range(n_ticks):
+        # Choose leak and pH anomaly junctions for this tick
+        leak_flags = {
+            node: 1 if rng.random() < leak_prob else 0 for node in G.nodes()
+        }
+        abnormal_flags = {
+            node: 1 if rng.random() < ph_prob else 0 for node in G.nodes()
+        }
+        pressure_anom_flags = {
+            node: 1 if rng.random() < pressure_anom_prob else 0 for node in G.nodes()
+        }
+
+        # Update node attributes for each junction
+        new_pressure = {}
+        new_pH = {}
+
+        for node in G.nodes():
+            base_p = (
+                baseline_pressure_mean
+                + rng.normal(0, baseline_pressure_std * 0.3)
+            )
+            base_ph = baseline_pH_mean + rng.normal(0, baseline_pH_std * 0.3)
+
+            p = base_p
+            ph = base_ph
+
+            # Apply leak (sharp drop) and small spillover to neighbors
+            if leak_flags[node] == 1:
+                p -= rng.uniform(12, 20)
+
+            # Pressure anomaly spikes / drops
+            if pressure_anom_flags[node] == 1:
+                p += rng.uniform(-15, 15)
+
+            # pH anomalies
+            if abnormal_flags[node] == 1:
+                ph += rng.uniform(-0.8, 0.8)
+
+            # Neighbor influence: small smoothing
+            neighbors = list(G.neighbors(node))
+            if neighbors:
+                neighbor_pressures = [current_pressure[n] for n in neighbors]
+                neighbor_pHs = [current_pH[n] for n in neighbors]
+                p = 0.8 * p + 0.2 * float(np.mean(neighbor_pressures))
+                ph = 0.8 * ph + 0.2 * float(np.mean(neighbor_pHs))
+
+            new_pressure[node] = p
+            new_pH[node] = ph
+
+        # After update, compute neighbor stats and feature deltas
+        for node in G.nodes():
+            p = new_pressure[node]
+            ph = new_pH[node]
+
+            neighbors = list(G.neighbors(node))
+            if neighbors:
+                n_pressures = [new_pressure[n] for n in neighbors]
+                n_pHs = [new_pH[n] for n in neighbors]
+                neighbor_avg_pressure = float(np.mean(n_pressures))
+                neighbor_avg_pH = float(np.mean(n_pHs))
+            else:
+                neighbor_avg_pressure = p
+                neighbor_avg_pH = ph
+
+            delta_pressure_from_baseline = p - baseline_pressure_mean
+            delta_pH_from_baseline = ph - baseline_pH_mean
+            delta_pressure_from_neighbors = p - neighbor_avg_pressure
+            delta_pH_from_neighbors = ph - neighbor_avg_pH
+
+            records.append(
+                {
+                    "junction_id": node,
+                    "tick": tick,
+                    "x": G.nodes[node]["x"],
+                    "y": G.nodes[node]["y"],
+                    "pressure": p,
+                    "pH": ph,
+                    "degree": float(G.degree[node]),
+                    "neighbor_avg_pressure": neighbor_avg_pressure,
+                    "neighbor_avg_pH": neighbor_avg_pH,
+                    "delta_pressure_from_baseline": delta_pressure_from_baseline,
+                    "delta_pH_from_baseline": delta_pH_from_baseline,
+                    "delta_pressure_from_neighbors": delta_pressure_from_neighbors,
+                    "delta_pH_from_neighbors": delta_pH_from_neighbors,
+                    "label_leak": leak_flags[node],
+                    "label_abnormal": int(
+                        (abnormal_flags[node] == 1)
+                        or (abs(delta_pH_from_baseline) > 0.5)
+                        or (abs(delta_pressure_from_baseline) > 10)
+                    ),
+                }
+            )
+
+        # Move new state into current state
+        current_pressure = new_pressure
+        current_pH = new_pH
+
+    sim_df = pd.DataFrame(records)
+
+    # Update ground truth attributes in the graph (if any leak/abnormal over time)
+    leak_truth = sim_df.groupby("junction_id")["label_leak"].max()
+    abnormal_truth = sim_df.groupby("junction_id")["label_abnormal"].max()
+    for node in G.nodes():
+        G.nodes[node]["leak_truth"] = int(leak_truth.get(node, 0))
+        G.nodes[node]["abnormal_truth"] = int(abnormal_truth.get(node, 0))
+
+    return sim_df
+
+
+def build_features(sim_df: pd.DataFrame):
+    """
+    For this portal, the simulation already created feature columns.
+    This function exists to keep the pipeline modular and hackathon-friendly.
+    """
+    feature_cols = [
+        "pressure",
+        "pH",
+        "degree",
+        "neighbor_avg_pressure",
+        "neighbor_avg_pH",
+        "delta_pressure_from_baseline",
+        "delta_pH_from_baseline",
+        "delta_pressure_from_neighbors",
+        "delta_pH_from_neighbors",
+    ]
+    X = sim_df[feature_cols].copy()
+    y_leak = sim_df["label_leak"].astype(int)
+    y_abnormal = sim_df["label_abnormal"].astype(int)
+    return X, y_leak, y_abnormal, feature_cols
+
+
+def train_models(sim_df: pd.DataFrame, random_state=0):
+    """
+    Train RandomForest models for leak and abnormal detection.
+    Returns trained models and metric summaries.
+    """
+    X, y_leak, y_abnormal, feature_cols = build_features(sim_df)
+
+    metrics = {}
+
+    def train_one_model(y, label_name):
+        # Guard against cases where there is only one class present
+        if len(np.unique(y)) < 2:
+            dummy_model = RandomForestClassifier(
+                n_estimators=10, max_depth=2, random_state=random_state
+            )
+            dummy_model.fit(X, y)
+            cm = np.array([[0, 0], [0, 0]])
+            f1 = 0.0
+            metrics[label_name] = {"f1": f1, "confusion_matrix": cm.tolist()}
+            return dummy_model
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X,
+            y,
+            test_size=0.25,
+            random_state=random_state,
+            stratify=y,
+        )
+
+        model = RandomForestClassifier(
+            n_estimators=100,
+            max_depth=6,
+            n_jobs=-1,
+            random_state=random_state,
+        )
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+
+        f1 = f1_score(y_test, y_pred, zero_division=0)
+        cm = confusion_matrix(y_test, y_pred, labels=[0, 1])
+
+        metrics[label_name] = {
+            "f1": float(f1),
+            "confusion_matrix": cm.tolist(),
+        }
+        return model
+
+    leak_model = train_one_model(y_leak, "leak_model")
+    abnormal_model = train_one_model(y_abnormal, "abnormal_model")
+
+    metrics["feature_columns"] = feature_cols
+
+    return leak_model, abnormal_model, metrics
+
+
+def predict_risk(
+    leak_model,
+    abnormal_model,
+    sim_df: pd.DataFrame,
+    feature_cols,
+):
+    """
+    Predict leak and abnormal risk for the latest tick, per junction.
+    Returns a DataFrame with per-junction risk scores.
+    """
+    if sim_df.empty:
+        return pd.DataFrame()
+
+    latest_tick = sim_df["tick"].max()
+    df_latest = sim_df[sim_df["tick"] == latest_tick].copy()
+
+    X_latest = df_latest[feature_cols]
+
+    leak_proba = leak_model.predict_proba(X_latest)[:, 1]
+    abnormal_proba = abnormal_model.predict_proba(X_latest)[:, 1]
+
+    df_latest["leak_risk"] = leak_proba
+    df_latest["abnormal_risk"] = abnormal_proba
+    df_latest["combined_risk"] = df_latest[["leak_risk", "abnormal_risk"]].max(axis=1)
+
+    # For convenience: mark ground truth label for tooltip
+    df_latest["ground_truth"] = df_latest.apply(
+        lambda row: "Leak"
+        if row["label_leak"] == 1
+        else ("Abnormal" if row["label_abnormal"] == 1 else "Normal"),
+        axis=1,
+    )
+
+    return df_latest.reset_index(drop=True)
+
+
+def plot_pipeline_map(G, risk_df, tick, risk_threshold=0.6, medium_threshold=0.3):
+    """
+    Plotly map of the pipeline network.
+    Pipelines as faint lines, junctions as markers colored by combined risk.
+    """
+    if G is None or risk_df is None or risk_df.empty:
+        return go.Figure()
+
+    # If risk_df is only latest tick, we still want to show selected tick;
+    # fall back to nearest available tick if needed.
+    if "tick" in risk_df.columns and risk_df["tick"].nunique() > 1:
+        df_tick = risk_df[risk_df["tick"] == tick].copy()
+        if df_tick.empty:
+            df_tick = risk_df[risk_df["tick"] == risk_df["tick"].max()].copy()
+    else:
+        df_tick = risk_df.copy()
+        df_tick["tick"] = tick
+
+    # Edge traces (pipelines)
+    edge_x = []
+    edge_y = []
+    for u, v in G.edges():
+        x0 = G.nodes[u]["x"]
+        y0 = G.nodes[u]["y"]
+        x1 = G.nodes[v]["x"]
+        y1 = G.nodes[v]["y"]
+        edge_x.extend([x0, x1, None])
+        edge_y.extend([y0, y1, None])
+
+    edge_trace = go.Scatter(
+        x=edge_x,
+        y=edge_y,
+        line=dict(width=1, color="rgba(100,100,100,0.4)"),
+        hoverinfo="none",
+        mode="lines",
+        name="Pipelines",
+    )
+
+    # Node traces (junctions)
+    # Align risk_df by junction_id
+    node_x = []
+    node_y = []
+    colors = []
+    sizes = []
+    text = []
+
+    risk_lookup = risk_df.set_index("junction_id") if "junction_id" in risk_df.columns else None
+
+    for node in G.nodes():
+        x = G.nodes[node]["x"]
+        y = G.nodes[node]["y"]
+        node_x.append(x)
+        node_y.append(y)
+
+        if (risk_lookup is not None) and (node in risk_lookup.index):
+            row = risk_lookup.loc[node]
+            combined = float(row["combined_risk"])
+            leak_risk = float(row["leak_risk"])
+            abnormal_risk = float(row["abnormal_risk"])
+            pressure = float(row["pressure"])
+            ph = float(row["pH"])
+            gt = str(row.get("ground_truth", "Unknown"))
+
+            if combined >= risk_threshold:
+                c = "red"
+            elif combined >= medium_threshold:
+                c = "orange"
+            else:
+                c = "green"
+
+            colors.append(c)
+            sizes.append(12 + 8 * combined)
+            text.append(
+                f"Junction: {node}<br>"
+                f"Pressure: {pressure:.2f}<br>"
+                f"pH: {ph:.2f}<br>"
+                f"Leak risk: {leak_risk:.2f}<br>"
+                f"Abnormal risk: {abnormal_risk:.2f}<br>"
+                f"Combined risk: {combined:.2f}<br>"
+                f"Ground truth: {gt}"
+            )
+        else:
+            colors.append("green")
+            sizes.append(10)
+            text.append(f"Junction: {node}<br>No risk prediction available")
+
+    node_trace = go.Scatter(
+        x=node_x,
+        y=node_y,
+        mode="markers",
+        hoverinfo="text",
+        text=text,
+        marker=dict(
+            showscale=False,
+            color=colors,
+            size=sizes,
+            line=dict(width=1, color="black"),
+        ),
+        name="Junctions",
+    )
+
+    fig = go.Figure(data=[edge_trace, node_trace])
+    fig.update_layout(
+        title=f"City Water Pipeline Network – Tick {tick}",
+        showlegend=False,
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+        margin=dict(l=10, r=10, t=40, b=10),
+        height=600,
+    )
+    fig.update_yaxes(scaleanchor="x", scaleratio=1)
+    return fig
+
+
+def suggest_redirection(
+    G,
+    risk_df,
+    sources=None,
+    demands=None,
+    high_risk_threshold=0.6,
+    seed=0,
+):
+    """
+    Heuristic redirection advisor.
+    - Treat high-risk junctions as avoid zones.
+    - Suggest pipelines to isolate around leak-risk junctions.
+    - Compute alternative shortest paths from sources to demands.
+    """
+    rng = np.random.default_rng(seed)
+
+    # Determine default sources and demands if not provided
+    coords = pd.DataFrame(
+        [
+            {"junction_id": n, "x": G.nodes[n]["x"], "y": G.nodes[n]["y"]}
+            for n in G.nodes()
+        ]
+    )
+    coords["dist_origin"] = coords["x"] + coords["y"]
+    coords["dist_far"] = -coords["x"] - coords["y"]
+
+    if not sources:
+        default_sources = coords.nsmallest(3, "dist_origin")["junction_id"].tolist()
+    else:
+        default_sources = sources
+
+    if not demands:
+        default_demands = coords.nsmallest(6, "dist_far")["junction_id"].tolist()
+    else:
+        default_demands = demands
+
+    # Build risk mapping
+    if risk_df is None or risk_df.empty:
+        risk_map = {}
+    else:
+        risk_map = risk_df.set_index("junction_id")["combined_risk"].to_dict()
+
+    # Pipelines to isolate: any pipeline adjacent to very high-risk junctions
+    pipelines_to_isolate = set()
+    for node, risk in risk_map.items():
+        if risk >= high_risk_threshold:
+            for nbr in G.neighbors(node):
+                edge = tuple(sorted((node, nbr)))
+                pipelines_to_isolate.add(edge)
+
+    pipelines_to_isolate = sorted(list(pipelines_to_isolate))
+
+    # Build a weighted graph penalizing high-risk junctions
+    H = nx.Graph()
+    for u, v, data in G.edges(data=True):
+        base_weight = 1.0
+        risk_u = risk_map.get(u, 0.0)
+        risk_v = risk_map.get(v, 0.0)
+
+        if risk_u >= high_risk_threshold or risk_v >= high_risk_threshold:
+            # Strong penalty / effectively avoid
+            weight = 100.0
+        else:
+            # Mild penalty proportional to average risk
+            avg_risk = (risk_u + risk_v) / 2.0
+            weight = base_weight + 5.0 * avg_risk
+
+        H.add_edge(u, v, weight=weight)
+
+    # Compute paths
+    path_suggestions = []
+    for demand in default_demands:
+        best_path = None
+        best_length = float("inf")
+        best_source = None
+
+        for source in default_sources:
+            if source == demand:
+                continue
+            try:
+                path = nx.shortest_path(H, source=source, target=demand, weight="weight")
+                length = nx.path_weight(H, path, weight="weight")
+                if length < best_length:
+                    best_path = path
+                    best_length = length
+                    best_source = source
+            except nx.NetworkXNoPath:
+                continue
+
+        if best_path is not None:
+            explanation = (
+                f"Reroute demand junction {demand} from source {best_source} "
+                f"using a path that bypasses high-risk zones where possible."
+            )
+            path_suggestions.append(
+                {
+                    "demand": demand,
+                    "source": best_source,
+                    "path": best_path,
+                    "weighted_length": best_length,
+                    "explanation": explanation,
+                }
+            )
+        else:
+            path_suggestions.append(
+                {
+                    "demand": demand,
+                    "source": None,
+                    "path": None,
+                    "weighted_length": None,
+                    "explanation": f"No safe path found for demand junction {demand}.",
+                }
+            )
+
+    return pipelines_to_isolate, path_suggestions, default_sources, default_demands
+
+
+# ==========================
+# Demo Mode
+# ==========================
+def run_demo_pipeline():
+    # Network
+    G, coords_df = generate_pipeline_network(rows=8, cols=8, extra_loops=6, seed=42)
+    st.session_state.G = G
+    st.session_state.coords_df = coords_df
+
+    # Simulation
+    sim_df = simulate_conditions(
+        G,
+        n_ticks=60,
+        leak_prob=0.04,
+        ph_prob=0.04,
+        pressure_anom_prob=0.03,
+        seed=123,
+    )
+    st.session_state.sim_df = sim_df
+
+    # AI models
+    leak_model, abnormal_model, metrics = train_models(sim_df, random_state=0)
+    st.session_state.leak_model = leak_model
+    st.session_state.abnormal_model = abnormal_model
+    st.session_state.metrics = metrics
+
+    # Risk predictions for latest tick
+    feature_cols = metrics["feature_columns"]
+    risk_df = predict_risk(leak_model, abnormal_model, sim_df, feature_cols)
+    st.session_state.risk_df = risk_df
+
+    # Default tick
+    latest_tick = int(sim_df["tick"].max())
+    st.session_state.current_tick = latest_tick
+
+    # Default sources/demands based on risk_df and network
+    pipelines_to_isolate, path_suggestions, sources, demands = suggest_redirection(
+        G,
+        risk_df,
+        sources=None,
+        demands=None,
+        high_risk_threshold=0.6,
+    )
+    st.session_state.sources = sources
+    st.session_state.demands = demands
+
+    st.success("Demo mode: network generated, simulation run, models trained, and risks computed.")
+
+
+# ==========================
+# Sidebar Navigation
+# ==========================
+st.sidebar.title("City Water Pipeline Portal")
+
+page = st.sidebar.radio(
+    "Navigate website sections",
+    [
+        "Network Builder",
+        "Simulation",
+        "AI Detection",
+        "Pipeline Map",
+        "Redirection Advisor",
+    ],
+)
+
+st.sidebar.markdown("---")
+if st.sidebar.button("Run Demo Mode"):
+    run_demo_pipeline()
+
+st.sidebar.caption(
+    "This dashboard simulates a city water pipeline network, "
+    "detects leaks and anomalies, and proposes redirection strategies."
+)
+
+
+# ==========================
+# Page: Network Builder
+# ==========================
+def page_network_builder():
+    st.title("City Water Pipeline Network – Builder")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        rows = st.slider("Grid rows (junctions)", 4, 15, 8)
+    with col2:
+        cols = st.slider("Grid columns (junctions)", 4, 15, 8)
+    with col3:
+        extra_loops = st.slider("Extra loop pipelines", 0, 20, 6)
+
+    if st.button("Generate pipeline network"):
+        G, coords_df = generate_pipeline_network(
+            rows=rows, cols=cols, extra_loops=extra_loops, seed=42
+        )
+        st.session_state.G = G
+        st.session_state.coords_df = coords_df
+        st.session_state.sim_df = None
+        st.session_state.feature_df = None
+        st.session_state.leak_model = None
+        st.session_state.abnormal_model = None
+        st.session_state.metrics = None
+        st.session_state.risk_df = None
+        st.session_state.current_tick = None
+        st.success("Pipeline network generated.")
+
+    G = st.session_state.G
+    coords_df = st.session_state.coords_df
+
+    if G is None:
+        st.info("No network yet. Configure parameters and click **Generate pipeline network** or use **Demo Mode** in the sidebar.")
+        return
+
+    st.subheader("Network overview")
+    colA, colB, colC = st.columns(3)
+    with colA:
+        st.metric("Total junctions", value=len(G.nodes()))
+    with colB:
+        st.metric("Total pipelines", value=len(G.edges()))
+    with colC:
+        avg_degree = np.mean([d for _, d in G.degree()])
+        st.metric("Average degree", value=f"{avg_degree:.2f}")
+
+    st.markdown("#### Example of junction coordinates")
+    st.dataframe(coords_df.head(10), use_container_width=True)
+
+    # Quick static view of network structure
+    st.markdown("#### Structural view (pipeline layout sketch)")
+    fig = plot_pipeline_map(
+        G,
+        risk_df=pd.DataFrame(
+            [
+                {
+                    "junction_id": n,
+                    "pressure": 50.0,
+                    "pH": 7.2,
+                    "leak_risk": 0.0,
+                    "abnormal_risk": 0.0,
+                    "combined_risk": 0.0,
+                    "ground_truth": "Normal",
+                }
+                for n in G.nodes()
+            ]
+        ),
+        tick=0,
+        risk_threshold=0.6,
+        medium_threshold=0.3,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# ==========================
+# Page: Simulation
+# ==========================
+def page_simulation():
+    st.title("Hydraulic & Quality Simulation – Pipeline Network")
+
+    if st.session_state.G is None:
+        st.warning("Pipeline network not available. Open **Network Builder** and generate a network or use **Demo Mode**.")
+        return
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        n_ticks = st.slider("Simulation ticks", 10, 200, 60, step=10)
+    with col2:
+        leak_prob = st.slider("Leak probability per junction", 0.0, 0.2, 0.04, step=0.01)
+    with col3:
+        ph_prob = st.slider("pH anomaly probability", 0.0, 0.2, 0.04, step=0.01)
+    with col4:
+        pressure_anom_prob = st.slider(
+            "Pressure anomaly probability",
+            0.0,
+            0.2,
+            0.03,
+            step=0.01,
+        )
+
+    if st.button("Run simulation"):
+        sim_df = simulate_conditions(
+            st.session_state.G,
+            n_ticks=n_ticks,
+            leak_prob=leak_prob,
+            ph_prob=ph_prob,
+            pressure_anom_prob=pressure_anom_prob,
+            seed=123,
+        )
+        st.session_state.sim_df = sim_df
+        st.session_state.feature_df = None
+        st.session_state.leak_model = None
+        st.session_state.abnormal_model = None
+        st.session_state.metrics = None
+        st.session_state.risk_df = None
+        st.session_state.current_tick = int(sim_df["tick"].max())
+        st.success("Simulation completed.")
+
+    sim_df = st.session_state.sim_df
+    if sim_df is None:
+        st.info("No simulation results yet. Configure parameters and click **Run simulation**, or activate **Demo Mode**.")
+        return
+
+    st.subheader("Simulation snapshot")
+    st.write(
+        "Each row represents a junction at a specific tick with "
+        "pressure, pH, neighbor statistics, and labels."
+    )
+
+    st.dataframe(sim_df.head(20), use_container_width=True)
+
+    st.markdown("#### Label distribution")
+    colA, colB = st.columns(2)
+    with colA:
+        leak_counts = sim_df["label_leak"].value_counts().sort_index()
+        st.bar_chart(leak_counts, height=200)
+        st.caption("Leak labels (0 = normal, 1 = leak)")
+
+    with colB:
+        abnormal_counts = sim_df["label_abnormal"].value_counts().sort_index()
+        st.bar_chart(abnormal_counts, height=200)
+        st.caption("Abnormal labels (0 = normal, 1 = abnormal)")
+
+
+# ==========================
+# Page: AI Detection
+# ==========================
+def page_ai_detection():
+    st.title("AI Detection – Leak & Abnormality Classifiers")
+
+    if st.session_state.sim_df is None:
+        st.warning("Simulation data missing. Visit **Simulation** and run the model, or use **Demo Mode**.")
+        return
+
+    sim_df = st.session_state.sim_df
+
+    if st.button("Train AI models (Random Forest)"):
+        leak_model, abnormal_model, metrics = train_models(sim_df, random_state=0)
+        st.session_state.leak_model = leak_model
+        st.session_state.abnormal_model = abnormal_model
+        st.session_state.metrics = metrics
+
+        feature_cols = metrics["feature_columns"]
+        risk_df = predict_risk(leak_model, abnormal_model, sim_df, feature_cols)
+        st.session_state.risk_df = risk_df
+        if st.session_state.current_tick is None:
+            st.session_state.current_tick = int(sim_df["tick"].max())
+
+        st.success("Models trained and latest tick risk predictions generated.")
+
+    leak_model = st.session_state.leak_model
+    abnormal_model = st.session_state.abnormal_model
+    metrics = st.session_state.metrics
+
+    if leak_model is None or abnormal_model is None or metrics is None:
+        st.info("Click **Train AI models (Random Forest)** to build classifiers.")
+        return
+
+    st.subheader("Model performance overview")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        m = metrics["leak_model"]
+        st.markdown("##### Leak detection model")
+        st.metric("F1-score (leak)", f"{m['f1']:.3f}")
+        cm = pd.DataFrame(
+            m["confusion_matrix"],
+            index=["True 0", "True 1"],
+            columns=["Pred 0", "Pred 1"],
+        )
+        st.table(cm)
+
+    with col2:
+        m = metrics["abnormal_model"]
+        st.markdown("##### Abnormality detection model")
+        st.metric("F1-score (abnormal)", f"{m['f1']:.3f}")
+        cm = pd.DataFrame(
+            m["confusion_matrix"],
+            index=["True 0", "True 1"],
+            columns=["Pred 0", "Pred 1"],
+        )
+        st.table(cm)
+
+    st.markdown("##### Feature set used")
+    st.write(", ".join(metrics["feature_columns"]))
+
+    risk_df = st.session_state.risk_df
+    if risk_df is not None and not risk_df.empty:
+        st.markdown("##### Latest tick risk snapshot")
+        st.dataframe(
+            risk_df[
+                [
+                    "junction_id",
+                    "pressure",
+                    "pH",
+                    "leak_risk",
+                    "abnormal_risk",
+                    "combined_risk",
+                    "ground_truth",
+                ]
+            ].sort_values("combined_risk", ascending=False).head(15),
+            use_container_width=True,
+        )
+    else:
+        st.info("Train completed, but no risk table yet. Re-run if needed.")
+
+
+# ==========================
+# Page: Pipeline Map
+# ==========================
+def page_pipeline_map():
+    st.title("Pipeline Risk Map – Interactive View")
+
+    G = st.session_state.G
+    sim_df = st.session_state.sim_df
+    risk_df = st.session_state.risk_df
+
+    if G is None:
+        st.warning("Pipeline network missing. Visit **Network Builder** or use **Demo Mode**.")
+        return
+    if sim_df is None:
+        st.warning("Simulation data missing. Visit **Simulation** and run the model, or use **Demo Mode**.")
+        return
+    if risk_df is None or risk_df.empty:
+        st.warning("AI risk predictions missing. Visit **AI Detection** and train the models, or use **Demo Mode**.")
+        return
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        ticks = sorted(sim_df["tick"].unique().tolist())
+        default_tick = (
+            st.session_state.current_tick
+            if st.session_state.current_tick in ticks
+            else ticks[-1]
+        )
+        tick = st.slider(
+            "Select simulation tick",
+            min_value=int(ticks[0]),
+            max_value=int(ticks[-1]),
+            value=int(default_tick),
+            step=1,
+        )
+        st.session_state.current_tick = tick
+
+    with col2:
+        risk_threshold = st.slider(
+            "High-risk threshold (combined)",
+            0.2,
+            1.0,
+            0.6,
+            step=0.05,
+        )
+    with col3:
+        medium_threshold = st.slider(
+            "Medium-risk threshold (combined)",
+            0.0,
+            0.8,
+            0.3,
+            step=0.05,
+        )
+
+    # For map we want risk data aligned with tick if we retained all ticks, but
+    # by design risk_df is usually the latest tick. We still use it for coloring.
+    fig = plot_pipeline_map(
+        G,
+        risk_df,
+        tick=tick,
+        risk_threshold=risk_threshold,
+        medium_threshold=medium_threshold,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Top risk junctions (latest predictions)")
+    top_n = st.slider("Number of junctions to list", 5, 30, 15, step=5)
+
+    latest_risk = risk_df.copy()
+    st.dataframe(
+        latest_risk[
+            [
+                "junction_id",
+                "pressure",
+                "pH",
+                "leak_risk",
+                "abnormal_risk",
+                "combined_risk",
+                "ground_truth",
+            ]
+        ]
+        .sort_values("combined_risk", ascending=False)
+        .head(top_n),
+        use_container_width=True,
+    )
+
+
+# ==========================
+# Page: Redirection Advisor
+# ==========================
+def page_redirection_advisor():
+    st.title("Redirection Advisor – Rerouting Around Risk Zones")
+
+    G = st.session_state.G
+    risk_df = st.session_state.risk_df
+
+    if G is None:
+        st.warning("Pipeline network missing. Visit **Network Builder** or use **Demo Mode**.")
+        return
+    if risk_df is None or risk_df.empty:
+        st.warning("Risk predictions missing. Visit **AI Detection** and train the models, or use **Demo Mode**.")
+        return
+
+    st.markdown(
+        "This advisor proposes which pipelines to isolate around high-risk junctions "
+        "and suggests alternative paths from sources to demand zones."
+    )
+
+    high_risk_threshold = st.slider(
+        "High-risk avoidance threshold (combined risk)",
+        0.4,
+        0.9,
+        0.6,
+        step=0.05,
+    )
+
+    # Auto or manual selection of sources and demands
+    all_junctions = sorted(list(G.nodes()))
+    default_sources = st.session_state.sources or all_junctions[:3]
+    default_demands = st.session_state.demands or all_junctions[-6:]
+
+    sources = st.multiselect(
+        "Source junctions (water inlets)",
+        all_junctions,
+        default=default_sources,
+    )
+    demands = st.multiselect(
+        "Demand junctions (high population zones)",
+        all_junctions,
+        default=default_demands,
+    )
+
+    if st.button("Compute redirection strategy"):
+        pipelines_to_isolate, path_suggestions, final_sources, final_demands = (
+            suggest_redirection(
+                G,
+                risk_df,
+                sources=sources,
+                demands=demands,
+                high_risk_threshold=high_risk_threshold,
+            )
+        )
+        st.session_state.sources = final_sources
+        st.session_state.demands = final_demands
+
+        st.subheader("Pipelines to isolate around high-risk zones")
+        if pipelines_to_isolate:
+            isolate_df = pd.DataFrame(
+                [{"from_junction": u, "to_junction": v} for (u, v) in pipelines_to_isolate]
+            )
+            st.dataframe(isolate_df, use_container_width=True)
+        else:
+            st.info("No pipelines meet the high-risk isolation threshold at the moment.")
+
+        st.subheader("Recommended rerouted paths")
+        path_rows = []
+        for item in path_suggestions:
+            path_rows.append(
+                {
+                    "demand_junction": item["demand"],
+                    "source_junction": item["source"],
+                    "path_sequence": " → ".join(item["path"]) if item["path"] else "None",
+                    "weighted_length": (
+                        f"{item['weighted_length']:.2f}"
+                        if item["weighted_length"] is not None
+                        else "N/A"
+                    ),
+                    "explanation": item["explanation"],
+                }
+            )
+        st.dataframe(pd.DataFrame(path_rows), use_container_width=True)
+
+    else:
+        st.info("Configure high-risk threshold, sources, and demands, then run **Compute redirection strategy**.")
+
+
+# ==========================
+# Router
+# ==========================
+if page == "Network Builder":
+    page_network_builder()
+elif page == "Simulation":
+    page_simulation()
+elif page == "AI Detection":
+    page_ai_detection()
+elif page == "Pipeline Map":
+    page_pipeline_map()
+elif page == "Redirection Advisor":
+    page_redirection_advisor()
