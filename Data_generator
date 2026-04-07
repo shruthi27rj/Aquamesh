@@ -1,0 +1,27 @@
+import numpy as np
+import pandas as pd
+import random
+
+def generate_data():
+
+    zones = ["Zone A", "Zone B", "Zone C", "Zone D"]
+    data = []
+
+    for t in range(100):
+        for zone in zones:
+
+            flow = np.random.normal(60, 5)
+            ph = np.random.normal(7, 0.2)
+
+            # Random leak
+            if random.random() < 0.05:
+                flow += 40
+
+            # Random contamination
+            if random.random() < 0.03:
+                ph += 2
+
+            data.append([t, zone, flow, ph])
+
+    df = pd.DataFrame(data, columns=["Time", "Zone", "Flow", "pH"])
+    return df
